@@ -1,0 +1,30 @@
+version: '2'
+services:
+    page-crawler:
+        image: page-crawler
+        build:
+            context: ./
+            dockerfile: ./docker/crawler/Dockerfile
+        environment:
+            - MONGODB=mongodb://database
+            - CRAWLER_DB_NAME=crawler
+        restart: always
+    page-parser:
+        image: page-parser
+        build:
+            context: ./
+            dockerfile: ./docker/parser/Dockerfile
+        environment:
+            - MONGODB=mongodb://database
+            - CRAWLER_DB_NAME=crawler
+            - PARSER_DB_NAME=parser
+        restart: always
+    database:
+        image: mongo:3.6
+        volumes:
+            - mongodb:/data/db
+        restart: always
+        ports:
+            - 27017
+volumes:
+    mongodb:
