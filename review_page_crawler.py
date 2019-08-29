@@ -3,27 +3,21 @@ import re
 import uuid
 import time
 import json
+import gridfs
+import pymongo
 import logging
 import requests
 from tqdm import tqdm
 from bs4 import BeautifulSoup
-from settings import BOOKING_URL, HOT_CITY_URL, HTML_PATH
+from settings import BOOKING_URL, HOT_CITY_URL, MONGO_URI, CRAWLER_DB_NAME, PARSER_DB_NAME
 
 logger = logging.getLogger(__name__)
-logger.setLevel('NOTSET')
 
-URLS_PATH = './city_urls.json'
 
 def get_city_urls(city_soup):
     city_urls = []
-    problem_urls = []
-    logger.info('Get city urls....')
-    if os.path.exists(URLS_PATH):
-        with open(URLS_PATH, 'r') as f:
-            urls_json = json.load(f)
-            city_urls = urls_json['urls']
-            return city_urls
-    print('Get city urls....')
+    logger.info('Start getting city urls....')
+
     for city_item in tqdm(city_soup.findAll(class_ = 'block_header')):
         href = city_item.find('a')['href']
         city_page_html = requests.get(f'{BOOKING_URL}{href}')
@@ -36,40 +30,42 @@ def get_city_urls(city_soup):
                             })['href']
             city_urls.append(f'{BOOKING_URL}{city_page_href}')
         except: 
-            problem_urls.append(f'{BOOKING_URL}{href}')
-        time.sleep(0.1)
+            pass
+        time.sleep(0.05)
     logger.info('Finish getting city urls')
-    print('Finish getting city urls')
     return city_urls
 
-def generate_id(hotel_ids):
+def generate_id(hotel_ids_db):
     while(True):
         uid = str(uuid.uuid1())
         uid = uid.lower()
         uid = uid.replace('-','')
         uid = uid[:10]
-        if uid not in hotel_ids:
+
+        if not hotel_ids_db.find_one({'hotel_id': uid}):
+            hotel_ids_db.insert_one({'hotel_id': uid})
             return uid
 
-def get_exist_ids():
-    ids = []
-    for name in os.listdir('./hotel_html/'):
-        if name.startswith('.') is False:
-            ids.append(name)
-    return ids
-
-def crawl_review_page(url, hotel_id):
+def crawl_review_page(url, hotel_id, fs, parser_list_db):
     page = 1
-    path = f'{HTML_PATH}/{str(hotel_id)}'
-    if not os.path.exists(path):
-        os.makedirs(path)
+
     while(True):
+        uid = f'{hotel_id}_{page}'
+        information = {
+            'uid': uid,
+        }
         html = requests.get(url)
+        html.encoding = 'utf-8'
         soup = BeautifulSoup(html.text, 'html.parser')
         
-        file = open(f'{path}/page{str(page)}.html', 'w')
-        file.writelines(html.text)
-        file.close()
+        if not fs.find_one({'uid': uid}):
+            obj_id = fs.put(html.content, **information)
+            parser_list_db.insert({
+                'id': obj_id,
+                'hotel_id': hotel_id,
+                'uid': uid,
+                'status': 'waiting',
+            })
         
         next_page = soup.find(True, {"rel": "next"})
         if next_page is not None:
@@ -79,14 +75,21 @@ def crawl_review_page(url, hotel_id):
             break
         page += 1
 
-def crawl_city(city_url):
-    hotel_ids = get_exist_ids()
+
+def crawl_city(city_url, crawler_db, parser_db):
+
+    fs = gridfs.GridFS(crawler_db)
+    hotel_ids_db = crawler_db.hotel_ids
+    review_pages_db = crawler_db.review_pages
+    parser_list_db = parser_db.parser_list
+
     offset = 0
     max_offset = None
     while(True):
         now_url = city_url + f";offset={str(offset)}"
         now_html =  requests.get(now_url)
         now_soup = BeautifulSoup(now_html.text, 'html.parser')
+
         # Get nums of hotels
         if max_offset is None:
             pattern = re.compile(r"availableHotels:\s+\'[0-9]+\'")
@@ -95,29 +98,76 @@ def crawl_city(city_url):
                 match = pattern.search(str(script))
                 if match:
                     max_offset = int(match.group(0).split(':')[1].strip().replace('\'', ''))
+
+        # Get hotel review page
         for url in now_soup.findAll(class_ = "hotel_name_link url"):
-            hotel_id = generate_id(hotel_ids)
-            hotel_ids.append(hotel_id)
+            hotel_id = generate_id(hotel_ids_db)
             hotel_url = url['href'].strip().split('/')[-1]
             now_review_page_url = f'{BOOKING_URL}/reviews/my/hotel/{hotel_url}'
-            crawl_review_page(now_review_page_url, hotel_id)
+            review_page_status = review_pages_db.find_one({'city_url': city_url, 'hotel_url': now_review_page_url})
+            if review_page_status:
+                if (review_page_status['crawled'] == 'waiting'):
+                    crawl_review_page(now_review_page_url, hotel_id, fs, parser_list_db)
+                    review_pages_db.find_one_and_update({'city_url': city_url, 'hotel_url': now_review_page_url},
+                                                        {'$set': {'crawled': 'finish'}})
+                    
+            else:
+                review_pages_db.insert_one({
+                    'city_url': city_url,
+                    'hotel_url': now_review_page_url,
+                    'crawled': 'waiting',
+                })
+                crawl_review_page(now_review_page_url, hotel_id, fs, parser_list_db)
+                review_pages_db.find_one_and_update({'city_url': city_url, 'hotel_url': now_review_page_url},
+                                                    {'$set': {'crawled': 'finish'}})
 
         offset += 15
         if offset >= max_offset:
             break
-        
         time.sleep(0.05)
 
-def start_crawl(city_soup):
-    if not os.path.exists(HTML_PATH):
-        os.makedirs(HTML_PATH)
+def start_crawl(city_soup, crawler_db):
+    crawler_db = mongo_client[CRAWLER_DB_NAME]
+    parser_db = mongo_client[PARSER_DB_NAME]
 
     city_urls = get_city_urls(city_soup)
+    city_urls_db = crawler_db.city_urls
+    
+    # insert new city urls
+    logger.info('Update city urls...')
     for city_url in tqdm(city_urls):
-        crawl_city(city_url)
-            
+        if city_urls_db.find_one({'url': city_url}):
+            continue
+        
+        city_urls_db.insert_one({
+            'url': city_url,
+            'crawled': 'pending'
+        })
 
-if __name__ == "__main__":
-    city_html =  requests.get(HOT_CITY_URL)
+    # crawl and update db
+    logger.info('Update review page...')
+    for city_url in tqdm(city_urls):
+        # crawling pending urls
+        city_urls_status = city_urls_db.find_one({'url': city_url})
+        if city_urls_status:
+            if (city_urls_status['crawled'] == 'pending') or (city_urls_status['crawled'] == 'crawling'):
+                city_urls_db.find_one_and_update({'url': city_url}, {'$set': {'crawled': 'crawling'}})
+                crawl_city(city_url, crawler_db, parser_db)
+                # update finished city url
+                city_urls_db.find_one_and_update({'url': city_url}, {'$set': {'crawled': 'finish'}})
+
+
+if __name__ ==  "__main__":
+    logging.basicConfig(level=logging.INFO)
+    mongo_client = pymongo.MongoClient(MONGO_URI)
+
+    try:
+        mongo_client.server_info()
+        
+    except:
+        logger.warning(f'MongoDB is not connected')
+        exit()
+
+    city_html = requests.get(HOT_CITY_URL)
     city_soup = BeautifulSoup(city_html.text, 'html.parser')
-    start_crawl(city_soup)
+    start_crawl(city_soup, mongo_client)
