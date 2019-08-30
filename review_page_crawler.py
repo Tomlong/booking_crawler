@@ -46,7 +46,7 @@ def generate_id(hotel_ids_db):
             hotel_ids_db.insert_one({'hotel_id': uid})
             return uid
 
-def crawl_review_page(url, hotel_id, fs, parser_list_db):
+def crawl_review_page(url, hotel_id, fs, parser_list_db, review_page_id):
     page = 1
 
     while(True):
@@ -62,6 +62,7 @@ def crawl_review_page(url, hotel_id, fs, parser_list_db):
             obj_id = fs.put(html.content, **information)
             parser_list_db.insert({
                 'id': obj_id,
+                'review_page_id': review_page_id
                 'hotel_id': hotel_id,
                 'uid': uid,
                 'status': 'waiting',
@@ -107,17 +108,19 @@ def crawl_city(city_url, crawler_db, parser_db):
             review_page_status = review_pages_db.find_one({'city_url': city_url, 'hotel_url': now_review_page_url})
             if review_page_status:
                 if (review_page_status['crawled'] == 'waiting'):
-                    crawl_review_page(now_review_page_url, hotel_id, fs, parser_list_db)
+                    review_page_id = review_page_status._id
+                    crawl_review_page(now_review_page_url, hotel_id, fs, parser_list_db, review_page_id)
                     review_pages_db.find_one_and_update({'city_url': city_url, 'hotel_url': now_review_page_url},
                                                         {'$set': {'crawled': 'finish'}})
                     
             else:
-                review_pages_db.insert_one({
+                insert_data = {
                     'city_url': city_url,
                     'hotel_url': now_review_page_url,
                     'crawled': 'waiting',
-                })
-                crawl_review_page(now_review_page_url, hotel_id, fs, parser_list_db)
+                }
+                review_page_id = review_pages_db.insert_one(insert_data).inserted_id
+                crawl_review_page(now_review_page_url, hotel_id, fs, parser_list_db, review_page_id)
                 review_pages_db.find_one_and_update({'city_url': city_url, 'hotel_url': now_review_page_url},
                                                     {'$set': {'crawled': 'finish'}})
 
