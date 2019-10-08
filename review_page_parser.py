@@ -29,7 +29,7 @@ def parse_review(html, hotel_id, parser_db):
         logger.info(f'hotel name: {hotel_name}')
     except:
         hotel_name = ''
-    for review_box in soup.findAll("li", {"class": "review_item clearfix"}):
+    for review_box in soup.findAll("li", {"class": "review_item clearfix "}):
         # date
         try:
             date = review_box.find(True, {"class": "review_item_date"}).text.strip()
